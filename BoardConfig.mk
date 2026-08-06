@@ -106,43 +106,11 @@ BOARD_AVB_VENDOR_BOOT_ROLLBACK_INDEX_LOCATION := 1
 PLATFORM_SECURITY_PATCH := 2099-12-31
 VENDOR_SECURITY_PATCH := 2099-12-31
 PLATFORM_VERSION := 12
-# CRYPTO FULLY DISABLED in TWRP. This device's /data is A16 FBE + metadata encryption
-# with HW-wrapped keys that TWRP's built-in (A12-base) crypto CANNOT handle. With these
-# flags on, TWRP's FBE path runs at startup and does waitForService(KeyMint); the A12
-# keystore2 SIGSEGV-loops and KeyMint never registers, so TWRP's `recovery` process
-# blocks in futex_wait -> HANG ON THE LOGO (confirmed live: recovery.log stops at
-# "Using additional fstab for decryption", recovery pid in futex_wait, init spamming
-# "Could not find IKeystoreService"). Earlier WIPs hid this by auto-starting the A16
-# stack at boot to satisfy TWRP's wait - but that auto-decrypt rewrote the /data
-# metadata key (rot + KeyMint keyUpgrade of keymaster_key_blob) on EVERY boot, which
-# real Android then cannot use -> bootloop -> "Format Data".
-#
-# The decrypt is now 100% self-contained in decrypt.sh: it runs the WHOLE A16 security
-# stack + vold/vdc FROM THE FIRMWARE DUMP (/decrypt/...), reads the dump's own fstab for
-# the /data crypto options, and mounts /data itself. It uses NO TWRP crypto module, so
-# turning these OFF does not affect it. The only A12 services it touches are the base
-# servicemanager (always present, not crypto-gated) and keystore2 (it ctl.stops it);
-# with crypto off that stop is a harmless no-op and /dev/binder is free for the A16 sm.
-# Net result: TWRP boots straight to its GUI (no startup decrypt, no hang) and /data is
-# decrypted only on explicit  setprop twrp.decrypt.run 1  (decrypt.sh is non-destructive:
-# it snapshots + restores the pristine metadata key so Android still boots afterwards).
-#
-# IMPORTANT: these are -D compile flags -> a CLEAN recovery build is REQUIRED, or a
-# stale partitionmanager.o is reused and the change silently has no effect.
 TW_INCLUDE_CRYPTO := false
 TW_INCLUDE_CRYPTO_FBE := false
-BOARD_USES_QCOM_FBE_DECRYPTION := false
-TW_INCLUDE_FBE_METADATA_DECRYPT := false
+BOARD_USES_QCOM_FBE_DECRYPTION := true
+TW_INCLUDE_FBE_METADATA_DECRYPT := true
 BOARD_USES_METADATA_PARTITION := true
-
-# Custom recovery binary: apexservice stub for the A16-stack /data decrypt. The A16
-# keystore2 (run from the firmware dump by decrypt.sh) blocks during startup on
-# waitForService("apexservice") - apexd can't run in recovery - so this tiny native
-# service answers getActivePackages() empty and lets keystore2 finish.
-# Built as a SYSTEM binary (apexservice_stub/, via PRODUCT_PACKAGES in device.mk):
-# this tree has no recovery variant of libbinder, so relink the system binary + its
-# .so deps into the recovery ramdisk instead of forcing a recovery build.
-TW_RECOVERY_ADDITIONAL_RELINK_BINARY_FILES += $(TARGET_OUT_EXECUTABLES)/apexservice_stub
 
 # Display
 TW_BRIGHTNESS_PATH := "/sys/class/backlight/panel0-backlight/brightness"

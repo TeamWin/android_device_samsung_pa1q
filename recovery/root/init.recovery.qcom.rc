@@ -47,16 +47,8 @@ on fs
     symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
 	
 	# Mount firmware
-    # apnhlos is mounted FIRST here, so it owns the vfat superblock - vfat has no
-    # on-disk unix perms and a second mount of the same device reuses this sb's
-    # options, so perms MUST be set right here. A bare `mount vfat` inherits init's
-    # umask -> skeymast.mbn lands 0700 root:root, and the Samsung keymint_tee HAL runs
-    # as user *system*: it then can't open the TA ("Failed to open skeymast.mbn" ->
-    # nwd_tz_open failed -> createOperation -49 SECURE_HW_COMMUNICATION_FAILED ->
-    # /data metadata decrypt fails, fail_cause M02R). Use the stock fstab.qcom options:
-    # root:system, owner/group-readable (files 0440, dirs 0550).
     mkdir /vendor/firmware_mnt
-    mount vfat /dev/block/bootdevice/by-name/apnhlos /vendor/firmware_mnt ro uid=0,gid=1000,fmask=337,dmask=227,context=u:object_r:firmware_file:s0,shortname=lower
+    mount vfat /dev/block/bootdevice/by-name/apnhlos /vendor/firmware_mnt
 
     # Wait for vendor partition to be available
     wait /dev/block/platform/soc/${ro.boot.bootdevice}/by-name/vendor
@@ -106,6 +98,7 @@ on property:vendor.twrp.manual_check=true
 
 on post-fs
     start boot-hal-1-2
+    
 
 
 on boot
@@ -114,114 +107,6 @@ on boot
     # Release Samsung USB Secure Lock so USB-OTG mode works in recovery
     wait /sys/class/usb_notify/usb_control/usb_sl 5
     write /sys/class/usb_notify/usb_control/usb_sl SUNNY_WORK_MODE
-
-    # NOTE: decrypt is NOT auto-started anymore. It is a DESTRUCTIVE operation for the
-    # /data metadata key: vold's mountFstab makes KeyMint upgrade keymaster_key_blob and
-    # we rewrite `rot`, which real Android cannot use on its next boot -> bootloop ->
-    # "Format Data". Auto-running it on every recovery boot silently corrupted the key.
-    # decrypt.sh now snapshots + restores the pristine key dir, but it must only run when
-    # the user explicitly asks for it:  setprop twrp.decrypt.run 1  (via adb / terminal).
-
-# A16 decrypt: run the WHOLE Android-16 security stack from the dump, one version
-# (the A12 wall was: A16 KeyMint can't register in the A12 servicemanager). The stack
-# lives under /decrypt (NOT /mnt - vold tears down /mnt mounts). Auto-started above;
-# can also be re-triggered manually:  setprop twrp.decrypt.run 1
-on property:twrp.decrypt.run=1
-    mkdir /mnt/vendor/efs/DAK 0775 system system
-    chown system system /mnt/vendor/efs/DAK/gakkeybox
-    chmod 0644 /mnt/vendor/efs/DAK/gakkeybox
-    mkdir /data/vendor/keymaster 0775 system system
-    start decrypt
-
-# Oneshot orchestrator: mount dump -> VINTF overlay -> stop A12 sm/keystore2 ->
-# start the A16 stack below -> drive the metadata decrypt via the matched A16 vdc.
-service decrypt /system/bin/decrypt.sh
-    class main
-    user root
-    group root system
-    seclabel u:r:recovery:s0
-    oneshot
-    disabled
-
-# A16 servicemanager - claims /dev/binder once the orchestrator stops the A12 one.
-# MUST run as user ROOT: as user system it SIGABRTs immediately (cannot become the
-# binder context manager / set servicemanager.ready). Confirmed live - as root it is
-# stable and sets servicemanager.ready=true; as system it crash-loops on signal 6.
-service decrypt-servicemanager /system/bin/hal_run.sh /decrypt/system/bin/servicemanager
-    class core
-    user root
-    group root readproc
-    seclabel u:r:recovery:s0
-    disabled
-
-# apexservice stub - keystore2 blocks on waitForService("apexservice") during startup
-# (calls IApexService.getActivePackages()); the real apexd can't run in recovery (it
-# crashes on apex activation). This tiny native service (built from device tree, NOT
-# the dump) registers the name and returns an empty package list so keystore2 finishes
-# startup and registers IKeystoreService. Built against libbinder_ndk and run THROUGH
-# hal_run.sh (bootstrap linker + the A16 libbinder_ndk.so from the dump): the C++
-# libbinder addService wire format is not A12<->A16 stable and the A16 servicemanager
-# rejected the A12-marshalled call EX_BAD_PARCELABLE. Verified live 2026-06-14: this
-# wait blocked the whole decrypt chain.
-service decrypt-apexservice /system/bin/hal_run.sh /system/bin/apexservice_stub
-    class core
-    user root
-    group system
-    seclabel u:r:recovery:s0
-    disabled
-
-# qseecomd - stock notify-topology socket + root/drmrpc (TEE daemon KeyMint needs).
-service decrypt-qseecomd /system/bin/hal_run.sh /vendor/bin/qseecomd
-    socket notify-topology stream 660 system drmrpc
-    class main
-    user root
-    group root drmrpc
-    seclabel u:r:recovery:s0
-    disabled
-
-# KeyMint - stock user system, group system drmrpc.
-service decrypt-keymint /system/bin/hal_run.sh /vendor/bin/hw/android.hardware.security.keymint-service
-    class main
-    user system
-    group system drmrpc
-    seclabel u:r:recovery:s0
-    disabled
-
-# keystore2 - from the dump, DB dir /tmp/misc/keystore (matches TWRP's keystore2.rc).
-service decrypt-keystore2 /system/bin/hal_run.sh /decrypt/system/bin/keystore2 /tmp/misc/keystore
-    class main
-    user root
-    group root readproc log
-    seclabel u:r:recovery:s0
-    disabled
-
-# bootctl - the A16 IBootControl HAL from the dump. vold.mountFstab unconditionally
-# (via cp_needsCheckpoint, NOT the fstab checkpoint= flag) calls
-# waitForService("android.hardware.boot.IBootControl/default") and blocks forever if
-# it's absent - servicemanager can only try a non-existent .recovery variant. Stock
-# binary is /vendor/bin/hw/android.hardware.boot-service.qti (AIDL service over the
-# libboot_control_qti backend in /vendor/lib64; reads the A/B control block from /misc;
-# no TEE/SPU needed). Verified live: launched via the bootstrap linker it registers
-# IBootControl/default and vold passes the wait. Must be up before decrypt-vold.
-service decrypt-bootctl /system/bin/hal_run.sh /vendor/bin/hw/android.hardware.boot-service.qti
-    class core
-    user root
-    group root
-    seclabel u:r:recovery:s0
-    disabled
-
-# vold - THE decrypt driver. init creates its sockets and passes the OPEN fds. The
-# `knoxnative` socket is the one whose absence killed a bare vold launch
-# ("fail to get knoxnative socket -> Critical error occured. close.").
-service decrypt-vold /system/bin/hal_run.sh /decrypt/system/bin/vold --blkid_context=u:r:recovery:s0 --blkid_untrusted_context=u:r:recovery:s0 --fsck_context=u:r:recovery:s0 --fsck_untrusted_context=u:r:recovery:s0
-    socket vold stream 0660 root mount
-    socket cryptd stream 0660 root mount
-    socket knoxnative stream 0660 root root
-    class core
-    user root
-    group root mount
-    seclabel u:r:recovery:s0
-    disabled
 
 
    
